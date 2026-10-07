@@ -183,7 +183,7 @@ export default function DiagnoseBoard() {
           >
             只看可疑
           </Button>
-          <Button size="small" onClick={clearMarks} disabled={markedStringIds.length === 0}>
+          <Button size="small" onClick={() => void clearMarks()} disabled={markedStringIds.length === 0}>
             清空标记（{markedStringIds.length}）
           </Button>
           <Button
@@ -352,7 +352,7 @@ export default function DiagnoseBoard() {
                         <Button
                           size="small"
                           type="link"
-                          onClick={() => toggleMark(row.stringId)}
+                          onClick={() => void toggleMark(row.stringId)}
                         >
                           {markedStringIds.includes(row.stringId) ? '取消标记' : '标记'}
                         </Button>
@@ -419,7 +419,7 @@ export default function DiagnoseBoard() {
                 size="small"
                 block
                 style={{ marginTop: 10 }}
-                onClick={() => markMany(rank.top.map((item) => item.stringId))}
+                onClick={() => void markMany(rank.top.map((item) => item.stringId))}
               >
                 标记 Top 12
               </Button>
@@ -621,7 +621,7 @@ export default function DiagnoseBoard() {
               >
                 生成处置单
               </Button>
-              <Button onClick={() => toggleMark(target.stringId)}>
+              <Button onClick={() => void toggleMark(target.stringId)}>
                 {markedStringIds.includes(target.stringId) ? '取消标记' : '标记可疑'}
               </Button>
               <Button onClick={() => navigate('/samples')}>补充采集</Button>

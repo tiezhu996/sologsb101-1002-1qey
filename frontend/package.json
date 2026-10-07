@@ -8,6 +8,7 @@
     "dev": "vite --host --port 22802",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:db": "node scripts/run-db-tests.mjs",
     "preview": "vite preview --host --port 22802"
   },
   "dependencies": {
@@ -25,6 +26,7 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "~5.7.3",
     "vite": "^5.4.11"
   }

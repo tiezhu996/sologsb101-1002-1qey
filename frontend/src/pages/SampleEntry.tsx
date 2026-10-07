@@ -384,7 +384,7 @@ export default function SampleEntry() {
                       <Button
                         size="small"
                         type={markedStringIds.includes(row.stringId) ? 'primary' : 'default'}
-                        onClick={() => toggleMark(row.stringId)}
+                        onClick={() => void toggleMark(row.stringId)}
                       >
                         {markedStringIds.includes(row.stringId) ? '已标记' : '标记'}
                       </Button>

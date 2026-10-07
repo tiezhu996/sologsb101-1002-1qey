@@ -5,18 +5,24 @@
 import { create } from 'zustand';
 import {
   ROW_REVISION,
+  clearAllMarks,
+  deleteMark,
   getThresholds,
   listInverters,
+  listMarks,
   listPlants,
   listArrays,
   listSamples,
   listStrings,
+  putMark,
+  putMarks,
   putSample,
   putSamples,
   removeSample,
   type InverterRow,
   type PlantRow,
   type ArrayRow as DbArrayRow,
+  type MarkRow,
   type SampleRow,
   type StringRow,
 } from '../utils/db';
@@ -35,7 +41,7 @@ interface SampleStoreState {
   plants: PlantRow[];
   stats: StringDiscreteStat[];
   thresholds: ThresholdConfig;
-  /** 人工标记的可疑组串（跨页共享，排查台与采集页同步） */
+  /** 人工标记的可疑组串（落 IndexedDB，重开浏览器后仍保留，排查台与采集页同步） */
   markedStringIds: string[];
   loading: boolean;
   error: string;
@@ -47,9 +53,12 @@ interface SampleStoreState {
   updateSample: (sampleId: string, draft: SampleDraft) => Promise<void>;
   deleteSample: (sampleId: string) => Promise<void>;
   deleteSamplesOfString: (stringId: string) => Promise<void>;
-  toggleMark: (stringId: string) => void;
-  markMany: (stringIds: string[]) => void;
-  clearMarks: () => void;
+  /** 切换单个标记（录入 / 取消），结果写入本地库 */
+  toggleMark: (stringId: string) => Promise<void>;
+  /** 批量并入标记，已存在的不重复计数 */
+  markMany: (stringIds: string[]) => Promise<void>;
+  /** 清空全部标记并落库 */
+  clearMarks: () => Promise<void>;
   sampleRows: () => SampleViewRow[];
   samplesOfString: (stringId: string) => SampleRow[];
   statsOfString: (stringId: string) => StringDiscreteStat | null;
@@ -100,16 +109,25 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   async loadSamples() {
     set({ loading: true });
     try {
-      const [samples, strings, inverters, arrays, plants, thresholdRow] = await Promise.all([
+      const [samples, strings, inverters, arrays, plants, thresholdRow, marks] = await Promise.all([
         listSamples(),
         listStrings(),
         listInverters(),
         listArrays(),
         listPlants(),
         getThresholds(),
+        listMarks(),
       ]);
       const thresholds: ThresholdConfig = { ...thresholdRow };
-      set((state) => ({
+      // 标记以本地库为事实来源，仅保留现存组串的标记；
+      // 悬空标记（组串被外部动作清退）顺带从库里清掉
+      const aliveIds = new Set(strings.map((item) => item.id));
+      const validMarks = marks.filter((item) => aliveIds.has(item.stringId));
+      if (validMarks.length !== marks.length) {
+        const staleIds = marks.filter((item) => !aliveIds.has(item.stringId)).map((item) => item.stringId);
+        await Promise.all(staleIds.map((id) => deleteMark(id)));
+      }
+      set({
         samples,
         strings,
         inverters,
@@ -119,10 +137,8 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         stats: hydrateStats(samples, strings, inverters, arrays, plants, thresholds),
         loading: false,
         error: '',
-        markedStringIds: state.markedStringIds.filter((id) =>
-          strings.some((item) => item.id === id),
-        ),
-      }));
+        markedStringIds: validMarks.map((item) => item.stringId),
+      });
     } catch (error) {
       set({ loading: false, error: error instanceof Error ? error.message : '采集数据读取失败' });
     }
@@ -217,20 +233,53 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
     emitChange();
   },
 
-  toggleMark(stringId) {
+  async toggleMark(stringId) {
+    // 乐观更新：先改内存让星标即时响应，再写本地库；写失败则回滚为库中真值
+    const willMark = !get().markedStringIds.includes(stringId);
     set((state) => ({
-      markedStringIds: state.markedStringIds.includes(stringId)
-        ? state.markedStringIds.filter((id) => id !== stringId)
-        : [...state.markedStringIds, stringId],
+      markedStringIds: willMark
+        ? [...state.markedStringIds, stringId]
+        : state.markedStringIds.filter((id) => id !== stringId),
     }));
+    try {
+      if (willMark) {
+        const row: MarkRow = { stringId, markedAt: nowIso() };
+        await putMark(row);
+      } else {
+        await deleteMark(stringId);
+      }
+    } catch (error) {
+      const marks = await listMarks();
+      set({ markedStringIds: marks.map((item) => item.stringId) });
+      throw error;
+    }
   },
 
-  markMany(stringIds) {
-    set((state) => ({ markedStringIds: [...new Set([...state.markedStringIds, ...stringIds])] }));
+  async markMany(stringIds) {
+    if (stringIds.length === 0) return;
+    const merged = [...new Set([...get().markedStringIds, ...stringIds])];
+    set({ markedStringIds: merged });
+    try {
+      const stamp = nowIso();
+      const rows: MarkRow[] = stringIds.map((stringId) => ({ stringId, markedAt: stamp }));
+      // bulkPut 幂等：已标记的不重复写入
+      await putMarks(rows);
+    } catch (error) {
+      const marks = await listMarks();
+      set({ markedStringIds: marks.map((item) => item.stringId) });
+      throw error;
+    }
   },
 
-  clearMarks() {
+  async clearMarks() {
     set({ markedStringIds: [] });
+    try {
+      await clearAllMarks();
+    } catch (error) {
+      const marks = await listMarks();
+      set({ markedStringIds: marks.map((item) => item.stringId) });
+      throw error;
+    }
   },
 
   sampleRows() {

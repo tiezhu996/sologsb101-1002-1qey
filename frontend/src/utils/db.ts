@@ -12,6 +12,7 @@ import type { Inverter } from '../types/inverter';
 import type { PvString } from '../types/string';
 import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
+import type { StringMark } from '../types/mark';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { normalizeCurrent, discreteRate } from './discrete';
@@ -21,7 +22,7 @@ import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -32,6 +33,8 @@ export type InverterRow = Inverter & Revisioned;
 export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
+/** 标记行即标记实体本身（主键 stringId，与组串同生命周期，不带行修订号） */
+export type MarkRow = StringMark;
 
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
@@ -41,6 +44,8 @@ class PvStringDatabase extends Dexie {
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
   settings!: Table<ThresholdRow, string>;
+  /** 人工标记的可疑组串（主键即 stringId，重开浏览器后仍保留） */
+  marks!: Table<MarkRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -96,6 +101,12 @@ class PvStringDatabase extends Dexie {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
       });
+
+    // v3：新增人工标记表 marks（主键即 stringId）。
+    //     旧库没有标记概念，升级后空表即可，无需搬移历史数据。
+    this.version(DB_SCHEMA_VERSION).stores({
+      marks: 'stringId',
+    });
   }
 }
 
@@ -422,11 +433,11 @@ export async function putPlant(row: PlantRow): Promise<void> {
   await db.plants.put(row);
 }
 
-/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 */
+/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 → 标记 */
 export async function removePlant(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.marks],
     async () => {
       const arrays = await db.arrays.where('plantId').equals(id).toArray();
       const arrayIds = arrays.map((item) => item.id);
@@ -441,6 +452,8 @@ export async function removePlant(id: string): Promise<void> {
       if (stringIds.length) {
         await db.samples.where('stringId').anyOf(stringIds).delete();
         await db.disposals.where('stringId').anyOf(stringIds).delete();
+        // 组串被清退：其人工标记一并从集合中移除
+        await db.marks.bulkDelete(stringIds);
       }
       if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
       if (arrayIds.length) await db.inverters.where('arrayId').anyOf(arrayIds).delete();
@@ -467,21 +480,29 @@ export async function putArray(row: ArrayRow): Promise<void> {
 }
 
 export async function removeArray(id: string): Promise<void> {
-  await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals], async () => {
-    const inverterRows = await db.inverters.where('arrayId').equals(id).toArray();
-    const inverterIds = inverterRows.map((item) => item.id);
-    const stringRows = inverterIds.length
-      ? await db.strings.where('inverterId').anyOf(inverterIds).toArray()
-      : [];
-    const stringIds = stringRows.map((item) => item.id);
-    if (stringIds.length) {
-      await db.samples.where('stringId').anyOf(stringIds).delete();
-      await db.disposals.where('stringId').anyOf(stringIds).delete();
-    }
-    if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
-    await db.inverters.where('arrayId').equals(id).delete();
-    await db.arrays.delete(id);
-  });
+  await db.transaction(
+    'rw',
+    [db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.marks],
+    async () => {
+      const inverterRows = await db.inverters.where('arrayId').equals(id).toArray();
+      const inverterIds = inverterRows.map((item) => item.id);
+      const stringRows = inverterIds.length
+        ? await db.strings.where('inverterId').anyOf(inverterIds).toArray()
+        : [];
+      const stringIds = stringRows.map((item) => item.id);
+      if (stringIds.length) {
+        await db.samples.where('stringId').anyOf(stringIds).delete();
+        await db.disposals.where('stringId').anyOf(stringIds).delete();
+        // 组串被清退：其人工标记一并从集合中移除
+        await db.marks.bulkDelete(stringIds);
+      }
+      if (inverterIds.length) {
+        await db.strings.where('inverterId').anyOf(inverterIds).delete();
+      }
+      await db.inverters.where('arrayId').equals(id).delete();
+      await db.arrays.delete(id);
+    },
+  );
 }
 
 /* ============================= 逆变器 ============================= */
@@ -499,12 +520,14 @@ export async function putInverter(row: InverterRow): Promise<void> {
 }
 
 export async function removeInverter(id: string): Promise<void> {
-  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals, db.marks], async () => {
     const stringRows = await db.strings.where('inverterId').equals(id).toArray();
     const stringIds = stringRows.map((item) => item.id);
     if (stringIds.length) {
       await db.samples.where('stringId').anyOf(stringIds).delete();
       await db.disposals.where('stringId').anyOf(stringIds).delete();
+      // 组串被清退：其人工标记一并从集合中移除
+      await db.marks.bulkDelete(stringIds);
     }
     await db.strings.where('inverterId').equals(id).delete();
     await db.inverters.delete(id);
@@ -531,9 +554,11 @@ export async function putStrings(rows: StringRow[]): Promise<void> {
 }
 
 export async function removeString(id: string): Promise<void> {
-  await db.transaction('rw', [db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.strings, db.samples, db.disposals, db.marks], async () => {
     await db.samples.where('stringId').equals(id).delete();
     await db.disposals.where('stringId').equals(id).delete();
+    // 组串被清退：其人工标记一并从集合中移除
+    await db.marks.delete(id);
     await db.strings.delete(id);
   });
 }
@@ -560,6 +585,46 @@ export async function putSamples(rows: SampleRow[]): Promise<void> {
 
 export async function removeSample(id: string): Promise<void> {
   await db.samples.delete(id);
+}
+
+/* ============================== 人工标记 ============================== */
+
+/** 读取全部人工标记，按标记时间从早到晚排序（保证集合顺序稳定） */
+export async function listMarks(): Promise<MarkRow[]> {
+  const rows = await db.marks.toArray();
+  return rows.sort((a, b) => a.markedAt.localeCompare(b.markedAt) || a.stringId.localeCompare(b.stringId));
+}
+
+/** 新增（已存在则覆盖，保留主键幂等） */
+export async function putMark(row: MarkRow): Promise<void> {
+  await db.marks.put(row);
+}
+
+/** 批量并入标记（bulkPut 幂等，已存在的行不重复计数） */
+export async function putMarks(rows: MarkRow[]): Promise<void> {
+  if (rows.length > 0) await db.marks.bulkPut(rows);
+}
+
+/** 删除单个组串的标记（取消标记） */
+export async function deleteMark(stringId: string): Promise<void> {
+  await db.marks.delete(stringId);
+}
+
+/** 清空全部标记 */
+export async function clearAllMarks(): Promise<void> {
+  await db.marks.clear();
+}
+
+/** 兜底清理：删除引用了不存在组串的标记，返回保留下来的有效标记 */
+export async function pruneMarks(): Promise<MarkRow[]> {
+  const [marks, existingIds] = await Promise.all([
+    listMarks(),
+    db.strings.toCollection().primaryKeys(),
+  ]);
+  const alive = new Set(existingIds);
+  const stale = marks.filter((item) => !alive.has(item.stringId));
+  if (stale.length > 0) await db.marks.bulkDelete(stale.map((item) => item.stringId));
+  return marks.filter((item) => alive.has(item.stringId));
 }
 
 /* ============================= 处置单 ============================= */
@@ -601,6 +666,12 @@ export interface DatabaseSnapshot {
   samples: Sample[];
   disposals: Disposal[];
   thresholds: ThresholdRow;
+  /**
+   * 人工标记的组串 id 集合（v3 起导出）。
+   * 注意：字段不存在（旧备份）与存在但是空数组（导出时确实没有标记）语义不同：
+   * 导入时字段不存在保留当前标记，字段存在则一律以快照为准。
+   */
+  markedStringIds?: string[];
 }
 
 function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
@@ -609,7 +680,7 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, thresholds, marks] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
@@ -617,6 +688,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     listSamples(),
     listDisposals(),
     getThresholds(),
+    listMarks(),
   ]);
   return {
     name: DB_NAME,
@@ -629,15 +701,20 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
     thresholds,
+    markedStringIds: marks.map((item) => item.stringId),
   };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
+  // 快照字段缺失（旧备份）时保留当前标记；存在（含空数组）时以快照为准
+  const snapshotMarks = Array.isArray(snapshot.markedStringIds);
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.marks],
     async () => {
+      // 旧备份没有标记字段：先取出当前标记，待组串落库后再按新集合清退
+      const retainedMarks = snapshotMarks ? [] : await listMarks();
       await Promise.all([
         db.plants.clear(),
         db.arrays.clear(),
@@ -649,10 +726,27 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.plants.bulkPut((snapshot.plants ?? []).map(rev));
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
       await db.inverters.bulkPut((snapshot.inverters ?? []).map(rev));
-      await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
+      const stringRows = (snapshot.strings ?? []).map(rev);
+      await db.strings.bulkPut(stringRows);
       await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
       await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
+
+      // 以导入后的组串集合为事实基准清退：引用不存在组串的标记一律丢弃
+      const aliveStringIds = new Set(stringRows.map((item) => item.id));
+      if (snapshotMarks) {
+        // 字段存在：快照是唯一事实来源（空数组即清空），避免旧备份覆盖新标记
+        await db.marks.clear();
+        const uniqueIds = [...new Set(snapshot.markedStringIds ?? [])]
+          .filter((id): id is string => typeof id === 'string')
+          .filter((id) => aliveStringIds.has(id));
+        const stamp = nowIso();
+        await putMarks(uniqueIds.map((stringId) => ({ stringId, markedAt: stamp })));
+      } else {
+        // 字段不存在：保留当前标记，仅清退随组串一起消失的部分，避免迁移后引用悬空
+        await db.marks.clear();
+        await putMarks(retainedMarks.filter((item) => aliveStringIds.has(item.stringId)));
+      }
     },
   );
 }
@@ -661,7 +755,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.marks],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -671,6 +765,8 @@ export async function resetDatabase(): Promise<void> {
         db.samples.clear(),
         db.disposals.clear(),
         db.settings.clear(),
+        // 重置即全新演示库：人工标记一并清空
+        db.marks.clear(),
       ]);
     },
   );
@@ -679,15 +775,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计，用于页脚与阈值页概览 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, marks] = await Promise.all([
     db.plants.count(),
     db.arrays.count(),
     db.inverters.count(),
     db.strings.count(),
     db.samples.count(),
     db.disposals.count(),
+    db.marks.count(),
   ]);
-  return { plants, arrays, inverters, strings, samples, disposals };
+  return { plants, arrays, inverters, strings, samples, disposals, marks };
 }
 
 /** 结构版本信息（/settings 页展示） */

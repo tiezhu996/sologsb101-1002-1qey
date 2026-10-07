@@ -132,7 +132,11 @@ export default function SettingsView() {
         title: '导入将覆盖当前全部数据',
         content: `备份导出时间：${snapshot.exportedAt ?? '未知'}，包含 ${snapshot.plants.length} 个电站、${
           snapshot.strings?.length ?? 0
-        } 个组串、${snapshot.samples?.length ?? 0} 条采集记录。确认导入？`,
+        } 个组串、${snapshot.samples?.length ?? 0} 条采集记录。确认导入？人工标记将${
+          Array.isArray(snapshot.markedStringIds)
+            ? `以备份为准（备份含 ${snapshot.markedStringIds.length} 个标记）`
+            : '保留当前标记（旧版本备份不含该字段）'
+        }，引用已不存在组串的标记会自动清退。`,
         okText: '确认导入',
         cancelText: '取消',
         onOk: async () => {

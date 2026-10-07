@@ -75,20 +75,21 @@ sologsb101-1002/
         ├── main.tsx             # 入口：ConfigProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 当前电站上下文）
         ├── styles/main.css
-        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts settings.ts persistence.ts
+        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts settings.ts mark.ts persistence.ts
         ├── stores/              # plantStore.ts deviceStore.ts sampleStore.ts disposalStore.ts
         ├── components/common/   # DiscreteBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
         ├── hooks/               # useStringRank.ts useIdbTable.ts
         ├── pages/               # PlantList.tsx DeviceLedger.tsx SampleEntry.tsx DiagnoseBoard.tsx DisposalList.tsx SettingsView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
+        ├── scripts/             # run-db-tests.mjs + 本地库逻辑测试（fake-indexeddb，无需浏览器）
         └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）与 v2 → v3 迁移（新增人工标记表 `marks`，旧库升级后为空表）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -100,6 +101,9 @@ sologsb101-1002/
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
+  | `marks` | 人工标记的可疑组串 | stringId（主键即组串 id，与组串同生命周期；重开浏览器仍保留） |
+
+- **人工标记持久化**：排查台 / 采集页的录入标记、批量标记（标记 Top 12）、取消标记与清空标记都直接写入 `marks` 表；组串改挂（逆变器 / 汇流箱变更而 id 不变）标记跟随保留，组串被删除或整站清退时级联清掉。整库快照以 `markedStringIds` 字段携带标记：导入时**字段存在**（含空数组）一律以快照为准，**字段不存在**（v2 旧备份）则保留当前标记；两种情况下引用已不存在组串的悬空标记都会被清退。
 
 - **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
 - **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
@@ -112,6 +116,7 @@ cd frontend
 npm install
 npm run dev        # http://localhost:22802
 npm run typecheck  # tsc --noEmit
+npm run test:db    # Node + fake-indexeddb 跑本地库持久化/导入/迁移逻辑测试
 npm run build      # tsc --noEmit && vite build
 npm run preview    # 预览构建产物
 ```
