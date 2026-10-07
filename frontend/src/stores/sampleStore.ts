@@ -7,6 +7,7 @@ import {
   ROW_REVISION,
   getThresholds,
   listInverters,
+  listMarks,
   listPlants,
   listArrays,
   listSamples,
@@ -14,6 +15,7 @@ import {
   putSample,
   putSamples,
   removeSample,
+  saveMarks,
   type InverterRow,
   type PlantRow,
   type ArrayRow as DbArrayRow,
@@ -35,7 +37,7 @@ interface SampleStoreState {
   plants: PlantRow[];
   stats: StringDiscreteStat[];
   thresholds: ThresholdConfig;
-  /** 人工标记的可疑组串（跨页共享，排查台与采集页同步） */
+  /** 人工标记的可疑组串（落库 marks 表，跨页共享且刷新后保留） */
   markedStringIds: string[];
   loading: boolean;
   error: string;
@@ -85,6 +87,19 @@ function hydrateStats(
 
 let unsubscribed: (() => void) | null = null;
 
+/**
+ * 本地标记变更序号：loadSamples 在途期间若发生标记变更，
+ * 以本地新值为准（其已落库），避免在途旧读覆盖新标记。
+ */
+let marksMutationSeq = 0;
+
+/** 标记集合整集落库；失败仅记录 error，不阻断页面操作 */
+function persistMarks(stringIds: string[], onError: (message: string) => void): void {
+  void saveMarks(stringIds).catch((error: unknown) => {
+    onError(error instanceof Error ? error.message : '人工标记保存失败');
+  });
+}
+
 export const useSampleStore = create<SampleStoreState>((set, get) => ({
   samples: [],
   strings: [],
@@ -99,17 +114,30 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
 
   async loadSamples() {
     set({ loading: true });
+    const marksSeqAtStart = marksMutationSeq;
     try {
-      const [samples, strings, inverters, arrays, plants, thresholdRow] = await Promise.all([
+      const [samples, strings, inverters, arrays, plants, thresholdRow, marks] = await Promise.all([
         listSamples(),
         listStrings(),
         listInverters(),
         listArrays(),
         listPlants(),
         getThresholds(),
+        listMarks(),
       ]);
       const thresholds: ThresholdConfig = { ...thresholdRow };
-      set((state) => ({
+      const stringIds = new Set(strings.map((item) => item.id));
+      // 加载期间若有本地标记变更，以本地新值为准；否则以本地库中的标记集合为准（重开页面后恢复）
+      const base =
+        marksSeqAtStart === marksMutationSeq
+          ? marks.map((row) => row.id)
+          : get().markedStringIds;
+      // 组串被清退或不存在时从集合中清掉，并把清理结果回写本地库
+      const markedStringIds = base.filter((id) => stringIds.has(id));
+      if (markedStringIds.length !== base.length) {
+        persistMarks(markedStringIds, (message) => set({ error: message }));
+      }
+      set({
         samples,
         strings,
         inverters,
@@ -117,12 +145,10 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
         plants,
         thresholds,
         stats: hydrateStats(samples, strings, inverters, arrays, plants, thresholds),
+        markedStringIds,
         loading: false,
         error: '',
-        markedStringIds: state.markedStringIds.filter((id) =>
-          strings.some((item) => item.id === id),
-        ),
-      }));
+      });
     } catch (error) {
       set({ loading: false, error: error instanceof Error ? error.message : '采集数据读取失败' });
     }
@@ -218,19 +244,26 @@ export const useSampleStore = create<SampleStoreState>((set, get) => ({
   },
 
   toggleMark(stringId) {
-    set((state) => ({
-      markedStringIds: state.markedStringIds.includes(stringId)
-        ? state.markedStringIds.filter((id) => id !== stringId)
-        : [...state.markedStringIds, stringId],
-    }));
+    const current = get().markedStringIds;
+    const next = current.includes(stringId)
+      ? current.filter((id) => id !== stringId)
+      : [...current, stringId];
+    marksMutationSeq += 1;
+    set({ markedStringIds: next });
+    persistMarks(next, (message) => set({ error: message }));
   },
 
   markMany(stringIds) {
-    set((state) => ({ markedStringIds: [...new Set([...state.markedStringIds, ...stringIds])] }));
+    const next = [...new Set([...get().markedStringIds, ...stringIds])];
+    marksMutationSeq += 1;
+    set({ markedStringIds: next });
+    persistMarks(next, (message) => set({ error: message }));
   },
 
   clearMarks() {
+    marksMutationSeq += 1;
     set({ markedStringIds: [] });
+    persistMarks([], (message) => set({ error: message }));
   },
 
   sampleRows() {

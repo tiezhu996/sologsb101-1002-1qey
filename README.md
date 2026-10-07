@@ -26,7 +26,7 @@ docker compose up -d --build # 代码改动后重建
 - 录入电站与方阵结构（装机容量、并网日期、纬度、倾角、方位角）
 - 维护逆变器 / 汇流箱 / 组串三级设备台账，支持批量新增组串
 - 采集组串电流、电压、辐照度，按汇流箱分组实时计算**离散率**（标准差 / 均值），辐照度不同自动做归一化修正
-- 在失配排查工作台按离散率与电流偏差排序、人工标记可疑组串、追溯同汇流箱与同逆变器对比
+- 在失配排查工作台按离散率与电流偏差排序、人工标记可疑组串（标记落库保存，刷新与重开后保留）、追溯同汇流箱与同逆变器对比
 - 下发处置单并回填复测电流，复测达基准 95% 自动判定消缺
 - 配置判定阈值、查看 IndexedDB 结构版本并做整库 JSON 导出 / 导入
 
@@ -88,7 +88,7 @@ sologsb101-1002/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）与 v2 → v3 的迁移（新增人工标记表 `marks`，既有表行修订号对齐）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -100,9 +100,11 @@ sologsb101-1002/
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
+  | `marks` | 人工标记（可疑组串） | id（即组串 id） |
 
 - **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
-- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
+- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。排查台的人工标记（录入 / 批量 / 取消 / 清空）整集落库 `marks` 表，刷新后恢复；组串改挂标记跟随，组串删除时级联剔除。
+- **整库快照与标记**：导出 JSON 含 `marks` 字段；导入时快照带该字段则以其为准整体替换（并剔除快照中不存在的组串），旧备份无该字段则保留当前标记不清空。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 
 ## 七、本地开发

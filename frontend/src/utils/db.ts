@@ -21,7 +21,7 @@ import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -33,6 +33,12 @@ export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
 
+/** 人工标记行：主键 id 即组串 id，组串改挂（同行改挂接）时标记自然跟随 */
+export interface MarkRow extends Revisioned {
+  id: string;
+  createdAt: string;
+}
+
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
   arrays!: Table<ArrayRow, string>;
@@ -41,6 +47,7 @@ class PvStringDatabase extends Dexie {
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
   settings!: Table<ThresholdRow, string>;
+  marks!: Table<MarkRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -57,7 +64,7 @@ class PvStringDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；组串补充 moduleModel 索引，处置单补充 owner 索引；
     //     采样表补充组合索引便于按组串+时间取窗口
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plants: 'id, name, gridDate, latitude, capacityMWp',
         arrays: 'id, plantId, code, capacityKw',
@@ -94,6 +101,35 @@ class PvStringDatabase extends Dexie {
         const existing = (await settings.get('threshold')) as ThresholdRow | undefined;
         if (!existing) {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
+        }
+      });
+
+    // v3：新增人工标记表 marks（排查台星标落库，主键即组串 id）；既有表结构不变
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        plants: 'id, name, gridDate, latitude, capacityMWp',
+        arrays: 'id, plantId, code, capacityKw',
+        inverters: 'id, arrayId, model, ratedKw',
+        strings: 'id, inverterId, combinerBox, code, moduleModel',
+        samples: 'id, stringId, sampledAt, [stringId+sampledAt]',
+        disposals: 'id, stringId, state, type, owner, dueDate',
+        settings: 'id',
+        marks: 'id',
+      })
+      .upgrade(async (tx) => {
+        // 行迁移：既有各表行修订号对齐到当前 ROW_REVISION；marks 为新表，无需数据迁移
+        const tables: Array<Table<Record<string, unknown>, string>> = [
+          tx.table('plants'),
+          tx.table('arrays'),
+          tx.table('inverters'),
+          tx.table('strings'),
+          tx.table('samples'),
+          tx.table('disposals'),
+        ];
+        for (const table of tables) {
+          await table.toCollection().modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+          });
         }
       });
   }
@@ -422,11 +458,11 @@ export async function putPlant(row: PlantRow): Promise<void> {
   await db.plants.put(row);
 }
 
-/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 */
+/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 → 人工标记 */
 export async function removePlant(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.marks],
     async () => {
       const arrays = await db.arrays.where('plantId').equals(id).toArray();
       const arrayIds = arrays.map((item) => item.id);
@@ -441,6 +477,8 @@ export async function removePlant(id: string): Promise<void> {
       if (stringIds.length) {
         await db.samples.where('stringId').anyOf(stringIds).delete();
         await db.disposals.where('stringId').anyOf(stringIds).delete();
+        // 组串被清退：同步从人工标记集合中剔除
+        await db.marks.where('id').anyOf(stringIds).delete();
       }
       if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
       if (arrayIds.length) await db.inverters.where('arrayId').anyOf(arrayIds).delete();
@@ -467,7 +505,7 @@ export async function putArray(row: ArrayRow): Promise<void> {
 }
 
 export async function removeArray(id: string): Promise<void> {
-  await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.marks], async () => {
     const inverterRows = await db.inverters.where('arrayId').equals(id).toArray();
     const inverterIds = inverterRows.map((item) => item.id);
     const stringRows = inverterIds.length
@@ -477,6 +515,8 @@ export async function removeArray(id: string): Promise<void> {
     if (stringIds.length) {
       await db.samples.where('stringId').anyOf(stringIds).delete();
       await db.disposals.where('stringId').anyOf(stringIds).delete();
+      // 组串被清退：同步从人工标记集合中剔除
+      await db.marks.where('id').anyOf(stringIds).delete();
     }
     if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
     await db.inverters.where('arrayId').equals(id).delete();
@@ -499,12 +539,14 @@ export async function putInverter(row: InverterRow): Promise<void> {
 }
 
 export async function removeInverter(id: string): Promise<void> {
-  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals, db.marks], async () => {
     const stringRows = await db.strings.where('inverterId').equals(id).toArray();
     const stringIds = stringRows.map((item) => item.id);
     if (stringIds.length) {
       await db.samples.where('stringId').anyOf(stringIds).delete();
       await db.disposals.where('stringId').anyOf(stringIds).delete();
+      // 组串被清退：同步从人工标记集合中剔除
+      await db.marks.where('id').anyOf(stringIds).delete();
     }
     await db.strings.where('inverterId').equals(id).delete();
     await db.inverters.delete(id);
@@ -531,9 +573,11 @@ export async function putStrings(rows: StringRow[]): Promise<void> {
 }
 
 export async function removeString(id: string): Promise<void> {
-  await db.transaction('rw', [db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.strings, db.samples, db.disposals, db.marks], async () => {
     await db.samples.where('stringId').equals(id).delete();
     await db.disposals.where('stringId').equals(id).delete();
+    // 组串被清退：同步从人工标记集合中剔除
+    await db.marks.delete(id);
     await db.strings.delete(id);
   });
 }
@@ -577,6 +621,28 @@ export async function removeDisposal(id: string): Promise<void> {
   await db.disposals.delete(id);
 }
 
+/* ============================= 人工标记 ============================= */
+
+export async function listMarks(): Promise<MarkRow[]> {
+  return db.marks.toArray();
+}
+
+/**
+ * 全量覆盖人工标记集合（排查台录入 / 批量 / 取消 / 清空统一经此落库）。
+ * 主键即组串 id：组串改挂（同行改挂接）标记自动跟随；组串删除由各级联事务剔除。
+ */
+export async function saveMarks(stringIds: string[]): Promise<void> {
+  const rows: MarkRow[] = [...new Set(stringIds)].map((id) => ({
+    id,
+    createdAt: nowIso(),
+    revision: ROW_REVISION,
+  }));
+  await db.transaction('rw', db.marks, async () => {
+    await db.marks.clear();
+    await db.marks.bulkPut(rows);
+  });
+}
+
 /* ============================ 阈值配置 ============================ */
 
 export async function getThresholds(): Promise<ThresholdRow> {
@@ -601,6 +667,8 @@ export interface DatabaseSnapshot {
   samples: Sample[];
   disposals: Disposal[];
   thresholds: ThresholdRow;
+  /** 人工标记的组串 id 集合（v3 起写入；旧备份无此字段，导入时保留当前标记） */
+  marks?: string[];
 }
 
 function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
@@ -609,7 +677,7 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, thresholds, marks] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
@@ -617,6 +685,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     listSamples(),
     listDisposals(),
     getThresholds(),
+    listMarks(),
   ]);
   return {
     name: DB_NAME,
@@ -629,6 +698,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
     thresholds,
+    marks: marks.map((row) => row.id),
   };
 }
 
@@ -636,7 +706,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.marks],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -653,6 +723,16 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
       await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
+      // 人工标记：快照携带 marks 字段时以其为事实来源整体替换（并剔除快照中不存在的组串）；
+      // 字段缺失（v2 及更早的旧备份）时不动 marks 表，保留当前标记，避免旧备份覆盖新标记
+      if (Array.isArray(snapshot.marks)) {
+        const snapshotStringIds = new Set((snapshot.strings ?? []).map((item) => item.id));
+        const rows: MarkRow[] = [...new Set(snapshot.marks)]
+          .filter((id): id is string => typeof id === 'string' && snapshotStringIds.has(id))
+          .map((id) => ({ id, createdAt: nowIso(), revision: ROW_REVISION }));
+        await db.marks.clear();
+        await db.marks.bulkPut(rows);
+      }
     },
   );
 }
@@ -661,7 +741,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings, db.marks],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -671,6 +751,7 @@ export async function resetDatabase(): Promise<void> {
         db.samples.clear(),
         db.disposals.clear(),
         db.settings.clear(),
+        db.marks.clear(),
       ]);
     },
   );
@@ -679,15 +760,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计，用于页脚与阈值页概览 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, marks] = await Promise.all([
     db.plants.count(),
     db.arrays.count(),
     db.inverters.count(),
     db.strings.count(),
     db.samples.count(),
     db.disposals.count(),
+    db.marks.count(),
   ]);
-  return { plants, arrays, inverters, strings, samples, disposals };
+  return { plants, arrays, inverters, strings, samples, disposals, marks };
 }
 
 /** 结构版本信息（/settings 页展示） */
